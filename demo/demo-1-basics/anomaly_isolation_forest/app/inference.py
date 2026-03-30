@@ -1,15 +1,16 @@
-# anomaly_api.py
+# inference.py
 
 from fastapi import FastAPI
 from pydantic import BaseModel
 import numpy as np
-import joblib
-import os
 import mlflow
+import mlflow.sklearn
+import os
 import time
+import json
 
 # -----------------------------
-# Initialize MLflow connection
+# Initialize MLflow
 # -----------------------------
 def init_mlflow():
     mlflow_uri = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow_server:5000")
@@ -20,38 +21,41 @@ def init_mlflow():
 
             mlflow.set_tracking_uri(mlflow_uri)
 
-            # Check connection
+            # Test connection
             mlflow.search_experiments()
 
-            mlflow.set_experiment("anomaly-detection")
+            # ✅ Set inference experiment
+            mlflow.set_experiment("anomaly-inference")
 
-            print("Connected to MLflow successfully")
+            print("✅ Connected to MLflow")
             return
 
         except Exception as e:
-            print("Waiting for MLflow...", e)
+            print("❌ Waiting for MLflow...", e)
             time.sleep(3)
 
     raise RuntimeError("Could not connect to MLflow")
 
 
-# Initialize MLflow
 init_mlflow()
 
 # -----------------------------
-# Load the model
+# Load model from MLflow
 # -----------------------------
-model_path = "model/isolation_forest_model.joblib"
+MODEL_NAME = "anomaly-detection-model"
 
-if not os.path.exists(model_path):
-    raise FileNotFoundError("Model not found at model/isolation_forest_model.joblib")
+try:
+    print("Trying to load model using alias: production")
+    model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}@production")
 
-model = joblib.load(model_path)
+except Exception as e:
+    print("⚠️ Alias not found, loading latest version instead:", e)
+    model = mlflow.sklearn.load_model(f"models:/{MODEL_NAME}/latest")
 
-print("Model loaded successfully")
+print("✅ Model loaded successfully")
 
 # -----------------------------
-# Define request schema
+# Request schema
 # -----------------------------
 class Metrics(BaseModel):
     cpu_usage: float
@@ -59,7 +63,7 @@ class Metrics(BaseModel):
 
 
 # -----------------------------
-# Initialize FastAPI app
+# FastAPI app
 # -----------------------------
 app = FastAPI(title="Anomaly Detection API")
 
@@ -70,31 +74,56 @@ app = FastAPI(title="Anomaly Detection API")
 @app.post("/predict")
 def predict_anomaly(metrics: Metrics):
 
-    features = np.array([[metrics.cpu_usage, metrics.memory_usage]])
-    prediction = model.predict(features)
+    print("🚀 /predict API HIT")
 
-    result = "anomaly" if prediction[0] == -1 else "normal"
+    try:
+        # Prepare input
+        features = np.array([[metrics.cpu_usage, metrics.memory_usage]])
 
-    # -----------------------------
-    # Log inference in MLflow
-    # -----------------------------
-    with mlflow.start_run(run_name="inference-run"):
+        # Predict
+        prediction = model.predict(features)
+        result = "anomaly" if prediction[0] == -1 else "normal"
 
-        # Log inputs
-        mlflow.log_param("cpu_usage", metrics.cpu_usage)
-        mlflow.log_param("memory_usage", metrics.memory_usage)
+        print(f"Prediction: {result}")
 
-        # Log output
-        mlflow.log_param("prediction", result)
+        # -----------------------------
+        # MLflow Logging
+        # -----------------------------
+        with mlflow.start_run(run_name="inference-run") as run:
 
-        # Log simple metric
-        mlflow.log_metric("is_anomaly", 1 if result == "anomaly" else 0)
+            print(f"MLflow Run ID: {run.info.run_id}")
 
-    # -----------------------------
-    # Return response
-    # -----------------------------
-    return {
-        "cpu_usage": metrics.cpu_usage,
-        "memory_usage": metrics.memory_usage,
-        "result": result
-    }
+            # Tags
+            mlflow.set_tag("stage", "inference")
+
+            # Metrics
+            mlflow.log_metric("cpu_usage", metrics.cpu_usage)
+            mlflow.log_metric("memory_usage", metrics.memory_usage)
+            mlflow.log_metric("is_anomaly", 1 if result == "anomaly" else 0)
+
+            # Params
+            mlflow.log_param("prediction_label", result)
+
+            # Artifact
+            inference_data = {
+                "cpu_usage": metrics.cpu_usage,
+                "memory_usage": metrics.memory_usage,
+                "prediction": result
+            }
+
+            with open("inference.json", "w") as f:
+                json.dump(inference_data, f)
+
+            mlflow.log_artifact("inference.json")
+
+            print("✅ Logged to MLflow")
+
+        return {
+            "cpu_usage": metrics.cpu_usage,
+            "memory_usage": metrics.memory_usage,
+            "result": result
+        }
+
+    except Exception as e:
+        print("❌ ERROR in prediction:", str(e))
+        return {"error": str(e)}
